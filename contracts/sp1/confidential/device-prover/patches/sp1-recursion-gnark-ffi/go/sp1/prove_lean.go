@@ -254,12 +254,15 @@ func proveLean(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness witness.
 // FFT tables (lean_load.go): each transform builds what it needs (a 32 MB twiddle table, and the 0.5 GB coset table for
 // a coset FFT) and drops it, where gnark keeps 2 GB of tables. A, B and C are padded and transformed in turn.
 func computeHLean(sol *cs.R1CSSolution, domain *fft.Domain) []fr.Element {
+	// Every transform spans all the cores: there are six of 2^24 points here, and gnark's default of one task leaves
+	// fifteen of sixteen cores idle through them. The butterfly network is the same whatever the count.
+	nbTasks := fft.WithNbTasks(runtime.NumCPU())
 	card := domain.Cardinality
 	toCoset := func(v []fr.Element) []fr.Element {
 		p := make([]fr.Element, card)
 		copy(p, v)
-		domain.FFTInverse(p, fft.DIF)
-		domain.FFT(p, fft.DIT, fft.OnCoset())
+		domain.FFTInverse(p, fft.DIF, nbTasks)
+		domain.FFT(p, fft.DIT, fft.OnCoset(), nbTasks)
 		return p
 	}
 	a := toCoset(sol.A)
@@ -284,7 +287,7 @@ func computeHLean(sol *cs.R1CSSolution, domain *fft.Domain) []fr.Element {
 		}
 	})
 	c = nil
-	domain.FFTInverse(a, fft.DIF, fft.OnCoset())
+	domain.FFTInverse(a, fft.DIF, fft.OnCoset(), nbTasks)
 	runtime.GC()
 	debug.FreeOSMemory()
 	return a
