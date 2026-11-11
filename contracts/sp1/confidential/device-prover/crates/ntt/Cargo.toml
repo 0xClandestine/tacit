@@ -1,0 +1,21 @@
+[package]
+name = "tacit-ntt"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "KoalaBear radix-2 NTT (DIT, both halves) on an Apple GPU, bit-identical to p3-dft's Radix2DitParallel"
+
+# Deliberately dependency-free: the p3 crates patch a GPU path in, so anything this crate depended on would close a
+# dependency cycle. It works on raw u32 limbs; the field arithmetic lives in ntt.metal.
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+
+# Only the tests compare against p3-dft, and only as a dev-dependency, for the same reason.
+[dev-dependencies]
+p3-field = "=0.4.3-succinct"
+p3-koala-bear = "=0.4.3-succinct"
+p3-matrix = "=0.4.3-succinct"
+p3-dft = "=0.4.3-succinct"
+p3-util = "=0.4.3-succinct"

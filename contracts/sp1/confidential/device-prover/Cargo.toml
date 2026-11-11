@@ -25,6 +25,9 @@ slop-symmetric = "6"
 slop-algebra = "6"
 slop-challenger = "6"
 tacit-leafhash = { path = "crates/leafhash" }
+tacit-ntt = { path = "crates/ntt" }
+slop-dft = "6"      # check() compares the GPU NTT against p3-dft's Radix2DitParallel, as the prover uses it
+slop-matrix = "6"
 sp1-recursion-gnark-ffi = { version = "=6.2.4", features = ["native"] }   # the patched one: check() runs the lean prover's self-test
 hex = "0.4"
 bincode = "1.3.3"
@@ -42,6 +45,7 @@ opt-level = 3
 [patch.crates-io]
 sp1-recursion-gnark-ffi = { path = "patches/sp1-recursion-gnark-ffi" }
 p3-bn254-fr = { path = "patches/p3-bn254-fr" }
+p3-dft = { path = "patches/p3-dft" }
 p3-challenger = { path = "patches/p3-challenger" }
 p3-koala-bear = { path = "patches/p3-koala-bear" }
 p3-field = { path = "patches/p3-field" }

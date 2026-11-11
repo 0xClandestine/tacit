@@ -702,7 +702,44 @@ fn check() -> bool {
     let cpu = check_inner_perm() && ext;
     let gpu = check_gpu();
     let g16 = check_groth16();
-    check_grind() && gpu && cpu && g16
+    let ntt = check_ntt();
+    check_grind() && gpu && cpu && g16 && ntt
+}
+
+/// The GPU NTT against the CPU's Radix2DitParallel, at the shapes the prover asks for and at every width up to 33.
+/// Widths that are not a multiple of four matter: the row bit-reversal works in uint4s where it can, and an earlier
+/// version silently left the last one to three columns unreversed, which made widths 5 and 21 produce wrong proofs.
+fn check_ntt() -> bool {
+    use slop_dft::p3::{NaiveDft, Radix2DitParallel, TwoAdicSubgroupDft};
+    use slop_algebra::AbstractField;
+    use slop_koala_bear::KoalaBear as KB;
+    use slop_matrix::dense::RowMajorMatrix;
+    use slop_matrix::Matrix;
+    if tacit_ntt::device().is_none() {
+        return true;
+    }
+    let build = |h: usize, w: usize, seed: u64| -> RowMajorMatrix<KB> {
+        let mut s = seed | 1;
+        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s % 0x7f000001) as u32 };
+        RowMajorMatrix::new((0..h * w).map(|_| KB::from_canonical_u32(next())).collect(), w)
+    };
+    let mut ok = true;
+    let mut shapes: Vec<(usize, usize)> = (1..=33).map(|w| (10usize, w)).collect();
+    shapes.extend([(12, 132), (13, 192), (14, 21), (16, 32)]);
+    for (log_h, w) in shapes {
+        let m = build(1 << log_h, w, 0x9e37 ^ ((w as u64) << 7));
+        // NaiveDft shares no code with the GPU path or with the patched Radix2DitParallel, so it cannot hide a
+        // mistake in either. It is quadratic, which is why the heights here stay small.
+        let want = NaiveDft.dft_batch(m.clone()).values;
+        let gpu = Radix2DitParallel::default().dft_batch(m).to_row_major_matrix().values;
+        let bad = gpu.iter().zip(&want).filter(|(a, b)| a != b).count();
+        ok &= bad == 0;
+        if bad != 0 {
+            println!("NTT 2^{log_h} x {w}: {bad} cells DIFFER");
+        }
+    }
+    println!("NTT on the GPU: every width 1..=33 and the prover's own shapes equal the CPU's Radix2DitParallel");
+    ok
 }
 
 // The quartic extension's product (p3-koala-bear's binomial_mul_4, through p3-field's BinomialExtensionField Mul) against

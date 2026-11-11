@@ -2266,13 +2266,12 @@ dependencies = [
 [[package]]
 name = "p3-dft"
 version = "0.4.3-succinct"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be6408b10a2c27eb13a7d5580c546c2179a8dc7dbc10a990657311891f9b41c0"
 dependencies = [
  "p3-field",
  "p3-matrix",
  "p3-maybe-rayon",
  "p3-util",
+ "tacit-ntt",
  "tracing",
 ]
 
@@ -4578,6 +4577,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tacit-ntt"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "p3-dft",
+ "p3-field",
+ "p3-koala-bear",
+ "p3-matrix",
+ "p3-util",
+]
+
+[[package]]
 name = "tacit-prover"
 version = "0.1.0"
 dependencies = [
@@ -4590,11 +4601,14 @@ dependencies = [
  "slop-algebra",
  "slop-bn254",
  "slop-challenger",
+ "slop-dft",
  "slop-koala-bear",
+ "slop-matrix",
  "slop-symmetric",
  "sp1-recursion-gnark-ffi",
  "sp1-sdk",
  "tacit-leafhash",
+ "tacit-ntt",
  "tiny-keccak",
  "tracing",
  "tracing-subscriber",
