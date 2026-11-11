@@ -277,8 +277,27 @@ extern "C" {
 }
 
 extern "C" {
+    fn tacit_ntt_fs_stage(
+        buf: *mut u32,
+        tw: *const u32,
+        tw_rev: *const u32,
+        n_log: u32,
+        width: u32,
+        step: u32,
+        base: u32,
+        subs: u32,
+    ) -> i32;
+}
+
+extern "C" {
     fn free(p: *mut std::ffi::c_void);
     fn posix_memalign(p: *mut *mut std::ffi::c_void, align: usize, size: usize) -> i32;
+}
+
+/// Test hook: one four-step stage exactly as the driver calls it.
+pub fn fs_stage_for_test(buf: &mut [u32], tw: &[u32], tw_rev: &[u32], n_log: u32, width: u32, step: u32, base: u32, subs: u32) -> i32 {
+    if gpu().is_none() { return -1; }
+    unsafe { tacit_ntt_fs_stage(buf.as_mut_ptr(), tw.as_ptr(), tw_rev.as_ptr(), n_log, width, step, base, subs) }
 }
 
 /// Test hook: the GPU's row bit-reversal applied to an `h x width` matrix.
@@ -306,4 +325,126 @@ pub fn debug_layer(
     let ok = run_half(&mut a, tw, log_h, layer, layer + 1, width as u32, gathered).is_some();
     a.read_into(out);
     ok
+}
+
+// ---- four-step (Bailey) NTT --------------------------------------------------
+//
+// The layer-by-layer kernel reads and writes the whole matrix once per layer. The four-step splits N = n1*n2 so each
+// sub-DFT is short enough to hold in threadgroup memory and is done in one pass: three passes instead of log_h.
+//
+//   with x[i + n1*j] and output index k2 + n2*k1,
+//   X[k2 + n2*k1] = sum_i [ w^(i*k2) * (w^n2)^(i*k1) ] * sum_j x[i+n1 j] * (w^n1)^(j*k2)
+//
+// stage 1: length-n2 DFT along j (stride n1), root w^n1
+// stage 2: multiply (i,k2) by w^(i*k2)
+// stage 3: length-n1 DFT along i (stride 1), root w^n2, read out to index k2 + n2*k1
+//
+// Each sub-DFT is the network of `kb_fs_tile`, which is p3's Radix2DitParallel: input bit-reversal, dit_layer for
+// layers 0..mid, the row reversal, then dit_layer_rev for layers mid..n_log with reversed twiddles.
+
+/// Whether the four-step path can run this shape.
+pub fn fourstep_supported(log_h: usize, width: usize) -> bool {
+    available() && (2..=24).contains(&log_h) && width > 0 && log_h.div_ceil(2) <= 12
+}
+
+/// A four-step DFT of an `h x width` matrix, in place, in the same order `dft_batch` materialises.
+pub fn dft_fourstep_in_place(values: &mut [u32], width: usize, tw_fwd: &[u32]) -> Option<()> {
+    let h = if width == 0 { 0 } else { values.len() / width };
+    if width == 0 || h == 0 || !h.is_power_of_two() {
+        return None;
+    }
+    let log_h = h.trailing_zeros() as usize;
+    if !fourstep_supported(log_h, width) {
+        return None;
+    }
+    let n1_log = log_h / 2;
+    let n2_log = log_h - n1_log;
+    let n1 = 1usize << n1_log;
+    let _ = gpu()?;
+    let n2 = 1usize << n2_log;
+
+    // Stage 1: length-n2 DFT along j (the slow index, stride n1), root w^n1.
+    let (tw1, tw1r) = stage_tables(tw_fwd, log_h, n2_log);
+    let r = unsafe {
+        tacit_ntt_fs_stage(values.as_mut_ptr(), tw1.as_ptr(), tw1r.as_ptr(), n2_log as u32, width as u32, n1 as u32, 1, n1 as u32)
+    };
+    if r != 0 {
+        if std::env::var("TACIT_NTT_DEBUG").is_ok() { eprintln!("fourstep: stage 1 rc={r}"); }
+        return None;
+    }
+    // Stage 2: twiddle (i,k2) by w^(i*k2); the full table holds w^k at [k].
+    // w^(i*k2): reduce the exponent mod h and look it up in the full table, which is the half table followed by
+    // its negation. The limbs are Montgomery form and negation there is p - x, same as in the canonical domain.
+    let half_h = h / 2;
+    let mut tw_full: Vec<u32> = Vec::with_capacity(h);
+    tw_full.extend_from_slice(&tw_fwd[..half_h]);
+    for k in 0..half_h {
+        tw_full.push(neg_cpu(tw_fwd[k]));
+    }
+    for i in 0..n1 {
+        for k2 in 0..n2 {
+            let tw = tw_full[(i * k2) % h];
+            // stage 1 left frequency k2 at physical row br(k2); scale it there, in place
+            let row = (i + n1 * rev_bits(k2, n2_log)) * width;
+            for c in 0..width {
+                values[row + c] = mul_cpu(values[row + c], tw);
+            }
+        }
+    }
+    // Stage 3: length-n1 DFT along i (stride 1), root w^n2, then read out to k2 + n2*k1.
+    let (tw3, tw3r) = stage_tables(tw_fwd, log_h, n1_log);
+    let r = unsafe {
+        tacit_ntt_fs_stage(values.as_mut_ptr(), tw3.as_ptr(), tw3r.as_ptr(), n1_log as u32, width as u32, 1, n1 as u32, n2 as u32)
+    };
+    if r != 0 {
+        if std::env::var("TACIT_NTT_DEBUG").is_ok() { eprintln!("fourstep: stage 3 rc={r}"); }
+        return None;
+    }
+    let mut out = vec![0u32; values.len()];
+    for k2 in 0..n2 {
+        for k1 in 0..n1 {
+            // stage 3 leaves frequency k1 at physical row br(k1) within sub k2
+            let src = (rev_bits(k1, n1_log) + n1 * k2) * width;
+            let dst = (k2 + n2 * k1) * width;
+            out[dst..dst + width].copy_from_slice(&values[src..src + width]);
+        }
+    }
+    values.copy_from_slice(&out);
+    Some(())
+}
+
+/// The forward and reversed twiddle tables for a sub-DFT: w_sub = w^(2^(log_h - n_log)).
+fn stage_tables(tw_fwd: &[u32], log_h: usize, n_log: usize) -> (Vec<u32>, Vec<u32>) {
+    let stride = 1usize << (log_h - n_log);
+    let fwd: Vec<u32> = (0..(1usize << n_log) / 2).map(|i| tw_fwd[i * stride]).collect();
+    // p3 builds the second half's table by reversing the INDEX BITS, not by reversing the list.
+    let mut rev = vec![0u32; fwd.len()];
+    for (i, &v) in fwd.iter().enumerate() {
+        rev[rev_bits(i, n_log - 1)] = v;
+    }
+    (fwd, rev)
+}
+
+/// Reverse the low `bits` bits of `x`.
+fn rev_bits(x: usize, bits: usize) -> usize {
+    let mut r = 0;
+    let mut v = x;
+    for _ in 0..bits { r = (r << 1) | (v & 1); v >>= 1; }
+    r
+}
+
+/// -x mod p, for turning w^(k+h/2) = -w^k back into a table lookup.
+fn neg_cpu(a: u32) -> u32 {
+    if a == 0 { 0 } else { 0x7f000001u32.wrapping_sub(a) }
+}
+
+/// One KoalaBear multiply in Montgomery form, for the twiddle pass between stages.
+fn mul_cpu(a: u32, b: u32) -> u32 {
+    const P: u64 = 0x7f000001;
+    const MU: u64 = 0x81000001;
+    let x = (a as u64) * (b as u64);
+    let t = x.wrapping_mul(MU) & 0xffff_ffff;
+    let u = t.wrapping_mul(P);
+    let hi = (x.wrapping_sub(u) >> 32) as u32;
+    if x < u { hi.wrapping_add(P as u32) } else { hi }
 }

@@ -192,3 +192,86 @@ kernel void kb_ntt_chunk(device uint *__restrict__ buf [[buffer(0)]],
     }
 }
 
+
+// ---- four-step sub-DFT, tile-resident ---------------------------------------
+
+#define FS_MAX_LEN 4096u
+
+struct FsParams {
+    uint n_log;    // log2 of the sub-DFT length, <= 12
+    uint width;    // columns in the matrix
+    uint step;     // rows between consecutive elements OF a sub-sequence
+    uint base;     // rows between consecutive sub-sequences' first elements
+    uint subs;     // number of sub-sequences
+};
+//
+// A length-2^n_log DFT along a strided axis, held entirely in threadgroup memory: one global load, all log2(n)
+// layers in the tile, one global store. This is the same network as kb_ntt_chunk, which is what the CPU's
+// Radix2DitParallel does:
+//
+//   bit-reverse the n elements, layers 0..mid with dit_layer, bit-reverse again, layers mid..n_log with
+//   dit_layer_rev (twiddles reversed). The second reversal is the step that was missing for a long time.
+//
+// dit_layer pairs (hi, hi+2^layer) and twiddles by tw[i << (n_log-1-layer)]; dit_layer_rev pairs
+// (start+i, start+i+2^(n_log-1-layer)) and uses one twiddle per block.
+kernel void kb_fs_tile(device uint *__restrict__ buf [[buffer(0)]],
+                       device const uint *__restrict__ tw [[buffer(1)]],
+                       device const uint *__restrict__ tw_rev [[buffer(2)]],
+                       constant FsParams &p [[buffer(3)]],
+                       uint tgx [[threadgroup_position_in_grid]],
+                       uint lane [[thread_position_in_threadgroup]],
+                       uint tg_size [[threads_per_threadgroup]]) {
+    uint n = 1u << p.n_log;
+    uint mid = p.n_log >> 1;
+    threadgroup uint tile[FS_MAX_LEN];
+
+    uint sub = tgx / p.width;
+    uint col = tgx % p.width;
+    // sub-sequence `sub` starts at row base*sub and steps by `step` rows: stage 1 walks down a block
+    // (step = n1), stage 3 walks along i (step = 1).
+    uint start = p.base * sub;
+
+    // load, and take the bit-reversal here so the tile holds the network's input order
+    for (uint k = lane; k < n; k += tg_size) tile[revbits(k, p.n_log)] = buf[(start + k * p.step) * p.width + col];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // first half: dit_layer, block pairing on 2^layer
+    for (uint layer = 0u; layer < mid; layer++) {
+        uint hb = 1u << layer, bs = hb << 1u;
+        uint lr = p.n_log - 1u - layer;
+        for (uint idx = lane; idx < (n >> 1); idx += tg_size) {
+            uint start = (idx / hb) * bs, off = idx % hb;
+            uint ia = start + off, ib = ia + hb;
+            uint lo, hi;
+            butterfly(tile[ia], tile[ib], tw[off << lr], lo, hi);
+            tile[ia] = lo;
+            tile[ib] = hi;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // between the halves p3 reverses the row index BITS, not the row order. Swap pairs from a scratch
+    // copy so no lane reads a half-swapped tile.
+    threadgroup uint flip[FS_MAX_LEN];
+    for (uint k = lane; k < n; k += tg_size) flip[k] = tile[k];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k = lane; k < n; k += tg_size) tile[revbits(k, p.n_log)] = flip[k];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // second half: dit_layer_rev, block pairing on 2^(n_log-1-layer), one twiddle per block
+    for (uint layer = mid; layer < p.n_log; layer++) {
+        uint lr = p.n_log - 1u - layer;
+        uint hb = 1u << lr, bs = hb << 1u;
+        for (uint idx = lane; idx < (n >> 1); idx += tg_size) {
+            uint block = idx / hb, off = idx % hb;
+            uint ia = block * bs + off, ib = ia + hb;
+            uint lo, hi;
+            butterfly(tile[ia], tile[ib], tw_rev[block], lo, hi);
+            tile[ia] = lo;
+            tile[ib] = hi;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint k = lane; k < n; k += tg_size) buf[(start + k * p.step) * p.width + col] = tile[k];
+}

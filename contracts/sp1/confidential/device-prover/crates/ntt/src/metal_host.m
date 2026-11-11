@@ -14,6 +14,7 @@ static id<MTLDevice> g_dev = nil;
 static id<MTLComputePipelineState> g_layer = nil;
 static id<MTLComputePipelineState> g_bitrev = nil;
 static id<MTLComputePipelineState> g_chunk = nil;
+static id<MTLComputePipelineState> g_fs = nil;
 static char g_name[128];
 
 // A command queue per thread. SP1 proves several stages at once, and a queue is not safe to share without waiting on it;
@@ -62,8 +63,9 @@ int32_t tacit_ntt_init(const char *msl, char *name, size_t name_len) {
         id<MTLFunction> fl = [lib newFunctionWithName:@"kb_ntt_layer"];
         id<MTLFunction> fb = [lib newFunctionWithName:@"kb_bitrev"];
         id<MTLFunction> fc = [lib newFunctionWithName:@"kb_ntt_chunk"];
-        if (!fl || !fb || !fc) {
-            fprintf(stderr, "tacit-ntt: kernel missing (layer=%d bitrev=%d chunk=%d)\n", fl != nil, fb != nil, fc != nil);
+        id<MTLFunction> ff = [lib newFunctionWithName:@"kb_fs_tile"];
+        if (!fl || !fb || !fc || !ff) {
+            fprintf(stderr, "tacit-ntt: kernel missing (layer=%d bitrev=%d chunk=%d fs=%d)\n", fl != nil, fb != nil, fc != nil, ff != nil);
             pthread_mutex_unlock(&g_init_lock); return -6;
         }
         g_layer = [g_dev newComputePipelineStateWithFunction:fl error:&err];
@@ -75,6 +77,11 @@ int32_t tacit_ntt_init(const char *msl, char *name, size_t name_len) {
         if (!g_bitrev) {
             fprintf(stderr, "tacit-ntt: bitrev pipeline: %s\n", err ? err.localizedDescription.UTF8String : "no message");
             pthread_mutex_unlock(&g_init_lock); return -5;
+        }
+        g_fs = [g_dev newComputePipelineStateWithFunction:ff error:&err];
+        if (!g_fs) {
+            fprintf(stderr, "tacit-ntt: fs pipeline: %s\n", err ? err.localizedDescription.UTF8String : "no message");
+            pthread_mutex_unlock(&g_init_lock); return -7;
         }
         g_chunk = [g_dev newComputePipelineStateWithFunction:fc error:&err];
         if (!g_chunk) {
@@ -244,6 +251,35 @@ int32_t tacit_ntt_bitrev(uint32_t *src, uint32_t *dst, uint32_t log_h, uint32_t 
         [enc setBytes:&log_h length:sizeof(log_h) atIndex:2];
         [enc setBytes:&width length:sizeof(width) atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(per, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        return cb.status == MTLCommandBufferStatusCompleted ? 0 : -3;
+    }
+}
+
+// One four-step stage: a length-2^n_log DFT along `stride`, one threadgroup per (sub-sequence, column).
+int32_t tacit_ntt_fs_stage(uint32_t *buf, const uint32_t *tw, const uint32_t *tw_rev, uint32_t n_log,
+                           uint32_t width, uint32_t step, uint32_t base, uint32_t subs) {
+    @autoreleasepool {
+        if (g_fs == nil) return -1;
+        if (n_log > 12) return -2;
+        id<MTLCommandBuffer> cb = [thread_queue() commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_fs];
+        uint64_t rows = (uint64_t)base * subs + (uint64_t)step * (1u << n_log);
+        id<MTLBuffer> b = wrap(buf, rows * width * 4);
+        id<MTLBuffer> bt = wrap((uint32_t *)tw, ((uint64_t)1 << (n_log - 1)) * 4);
+        id<MTLBuffer> btr = wrap((uint32_t *)tw_rev, ((uint64_t)1 << (n_log - 1)) * 4);
+        [enc setBuffer:b offset:0 atIndex:0];
+        [enc setBuffer:bt offset:0 atIndex:1];
+        [enc setBuffer:btr offset:0 atIndex:2];
+        struct { uint32_t n_log, width, step, base, subs; } p = { n_log, width, step, base, subs };
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        NSUInteger tg = 1u << n_log;
+        if (tg > 1024) tg = 1024;
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)subs * width, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
