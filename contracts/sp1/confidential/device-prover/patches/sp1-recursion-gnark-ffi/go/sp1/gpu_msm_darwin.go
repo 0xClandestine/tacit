@@ -24,6 +24,9 @@ void *tacit_msm_pts(int s);
 void *tacit_msm_order(int s);
 void *tacit_msm_start(int s);
 void *tacit_msm_out(void);
+void *tacit_msm_sbase(int s);
+void *tacit_msm_scount(int s);
+uint32_t tacit_msm_winslots(void);
 int tacit_msm_wait(int s);
 int tacit_msm_send(int s, uint32_t n, uint32_t first);
 */
@@ -49,6 +52,7 @@ const (
 	gpuWindows    = 16 // 16 windows of 16 bits hold a canonical BN254 scalar
 	gpuBuckets    = 1<<gpuWindowBits - 1
 	gpuBlock      = 1 << 21 // bases per block: 128 MB of points and 128 MB of order, twice over
+	msmPerThread  = 8192    // a bucket gets ceil(count/this) threads, so no one thread walks half a block
 )
 
 var (
@@ -149,6 +153,9 @@ func gpuMsmG1(dst *curve.G1Jac, bases []curve.G1Affine, scalars []fr.Element) er
 		ptsBuf := unsafe.Slice((*curve.G1Affine)(C.tacit_msm_pts(set)), gpuBlock)
 		order := unsafe.Slice((*uint32)(C.tacit_msm_order(set)), gpuBlock*gpuWindows)
 		start := unsafe.Slice((*uint32)(C.tacit_msm_start(set)), (gpuBuckets+1)*gpuWindows)
+		nb := gpuBuckets
+		sbase := unsafe.Slice((*uint32)(C.tacit_msm_sbase(set)), nb*gpuWindows)
+		scount := unsafe.Slice((*uint32)(C.tacit_msm_scount(set)), nb*gpuWindows)
 		hi := min(lo+gpuBlock, len(bases))
 		n := hi - lo
 		copy(ptsBuf[:n], bases[lo:hi])
@@ -175,6 +182,17 @@ func gpuMsmG1(dst *curve.G1Jac, bases []curve.G1Affine, scalars []fr.Element) er
 					acc += cnt[b+1]
 				}
 				st[gpuBuckets] = acc
+				// how many threads this window's bucket gets, and where its slots start
+				slot := uint32(0)
+				for b := 0; b < gpuBuckets; b++ {
+					need := (cnt[b+1] + msmPerThread - 1) / msmPerThread
+					if need == 0 {
+						need = 1 // keep every bucket's slots non-empty so the fold has something to read
+					}
+					sbase[w*nb+b] = slot
+					scount[w*nb+b] = need
+					slot += need
+				}
 				pos := cnt[:gpuBuckets]
 				copy(pos, st[:gpuBuckets])
 				ord := order[w*n : (w+1)*n]

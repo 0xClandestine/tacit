@@ -90,6 +90,30 @@ inline J jdouble(J p) {
     return r;
 }
 
+// add-2007-bl: the sum of two Jacobian points, for folding a bucket's partial sums.
+inline J jadd(J p, J q) {
+    if (is_zero(p.z)) return q;
+    if (is_zero(q.z)) return p;
+    F Z1Z1 = mul(p.z, p.z), Z2Z2 = mul(q.z, q.z);
+    F U1 = mul(p.x, Z2Z2), U2 = mul(q.x, Z1Z1);
+    F S1 = mul(mul(p.y, q.z), Z2Z2), S2 = mul(mul(q.y, p.z), Z1Z1);
+    F H = sub(U2, U1), rr = sub(S2, S1);
+    if (is_zero(H)) return is_zero(rr) ? jdouble(p) : infinity();
+    F HH = mul(H, H);
+    F I = add(HH, HH); I = add(I, I);
+    F Jv = mul(H, I);
+    rr = add(rr, rr);
+    F V = mul(U1, I);
+    J r;
+    r.x = sub(sub(mul(rr, rr), Jv), add(V, V));
+    r.y = sub(mul(rr, sub(V, r.x)), mul(S1, add(Jv, Jv)));
+    // add-2007-bl's z. The trailing *H is required here: madd's z-formula is for a mixed add (an affine second
+    // operand), and copying its shape for Jacobian+Jacobian gives a correct-looking but wrong point.
+    F zh = add(p.z, q.z);
+    r.z = mul(sub(sub(mul(zh, zh), Z1Z1), Z2Z2), H);
+    return r;
+}
+
 // madd-2007-bl: p + (x2, y2), the affine point (0, 0) being infinity.
 inline J madd(J p, F x2, F y2) {
     if (is_zero(x2) && is_zero(y2)) return p;
@@ -114,25 +138,68 @@ inline J madd(J p, F x2, F y2) {
     return r;
 }
 
-// One thread per (window, bucket): adds the points whose digit in that window is bucket + 1 to the bucket's sum, which
-// starts from infinity on a multi-exponentiation's first block (`first`) and carries over from the block before otherwise.
+// Adds the points whose digit in that window is bucket + 1 to the bucket's sum. A bucket's points are split across
+// several threads (`sbase`/`scount` say how many, and where that bucket's slots begin), each taking a contiguous run
+// and writing to `part`; bucket_fold then adds them up. One thread per bucket was the first version, and the witness
+// scalars are nothing like uniform: in the lowest window one digit holds half of a 2M block, so a single thread walked
+// a million points while the rest of the GPU sat idle, and the whole Groth16 step took 32 s against the CPU's 2 s.
 kernel void bucket_sum(device const F *pts [[buffer(0)]],
                        device const uint *order [[buffer(1)]],
                        device const uint *start [[buffer(2)]],
                        device J *out [[buffer(3)]],
+                       device J *part [[buffer(8)]],
                        constant uint &nb [[buffer(4)]],
                        constant uint &n [[buffer(5)]],
                        constant uint &windows [[buffer(6)]],
                        constant uint &first [[buffer(7)]],
+                       constant uint &winslots [[buffer(9)]],
+                       device const uint *sbase [[buffer(10)]],
+                       device const uint *scount [[buffer(11)]],
                        uint gid [[thread_position_in_grid]]) {
-    if (gid >= nb * windows) return;
-    uint w = gid / nb, b = gid % nb;
+    uint w = gid / winslots, slot = gid % winslots;
+    if (w >= windows) return;
     device const uint *st = start + (ulong)w * (nb + 1);
     device const uint *ord = order + (ulong)w * n;
-    J acc = first ? infinity() : out[gid];
-    for (uint k = st[b]; k < st[b + 1]; k++) {
+    device const uint *bs = sbase + (ulong)w * nb, *cs = scount + (ulong)w * nb;
+    // slots past the last bucket's are padding from the fixed dispatch width; they must not run, or every one of
+    // them would binary-search to the final bucket and overwrite the partials the fold is about to read.
+    if (slot >= bs[nb - 1] + cs[nb - 1]) return;
+    // find the bucket that owns this slot. Buckets are few relative to slots, so a scan from a running hint is not
+    // worth it: binary search the prefix over per-bucket slot counts, which is monotone in b.
+    uint lo_b = 0, hi_b = nb;
+    while (lo_b + 1 < hi_b) {
+        uint mid = (lo_b + hi_b) / 2;
+        if (bs[mid] <= slot) lo_b = mid; else hi_b = mid;
+    }
+    uint b = lo_b;
+    uint sp = slot - bs[b], nsp = cs[b];
+    uint a0 = st[b], e0 = st[b + 1], len = e0 - a0;
+    uint a = a0 + (uint)(((ulong)len * sp) / nsp);
+    uint e = a0 + (uint)(((ulong)len * (sp + 1)) / nsp);
+    J acc = infinity();
+    for (uint k = a; k < e; k++) {
         uint i = ord[k];
         acc = madd(acc, pts[2 * (ulong)i], pts[2 * (ulong)i + 1]);
+    }
+    part[gid] = acc;
+}
+
+// Folds each bucket's `splits` partial sums into its running sum, carrying over the block before unless `first`.
+kernel void bucket_fold(device J *out [[buffer(0)]],
+                        device const J *part [[buffer(1)]],
+                        constant uint &nb [[buffer(2)]],
+                        constant uint &windows [[buffer(3)]],
+                        constant uint &first [[buffer(4)]],
+                        constant uint &winslots [[buffer(5)]],
+                        device const uint *sbase [[buffer(6)]],
+                        device const uint *scount [[buffer(7)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= nb * windows) return;
+    uint w = gid / nb, b = gid % nb;
+    uint slot = sbase[(ulong)w * nb + b], nsp = scount[(ulong)w * nb + b];
+    J acc = first ? infinity() : out[gid];
+    for (uint sp = 0; sp < nsp; sp++) {
+        acc = jadd(acc, part[(ulong)w * winslots + slot + sp]);
     }
     out[gid] = acc;
 }

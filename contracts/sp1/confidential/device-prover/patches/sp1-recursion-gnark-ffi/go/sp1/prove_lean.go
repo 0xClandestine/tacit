@@ -162,7 +162,7 @@ func proveLean(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness witness.
 			if err := msm(m.dst, m.bases, m.sc); err != nil {
 				return err
 			}
-			leanPhase("msm "+m.name+" ("+where+")", t)
+			leanPhase(fmt.Sprintf("msm %s %d (%s)", m.name, len(m.bases), where), t)
 		}
 		return nil
 	}
