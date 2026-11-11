@@ -169,12 +169,16 @@ func proveLean(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness witness.
 	cpuG1 := func(dst *curve.G1Jac, bases []curve.G1Affine, scalars []fr.Element) error {
 		return msmG1(dst, bases, scalars, block)
 	}
-	g2 := func() (curve.G2Jac, error) {
+	// The G2 sum can go to the GPU too, but it needs its own canary: the G2 kernels are a separate pair, over F2.
+	g2 := func(where string, f func(*curve.G2Jac, []curve.G2Affine, []fr.Element) error) (curve.G2Jac, error) {
 		t := time.Now()
 		var bs curve.G2Jac
-		err := msmG2(&bs, pk.G2.B, wB, block)
-		leanPhase("msm B2 (CPU)", t)
+		err := f(&bs, pk.G2.B, wB)
+		leanPhase(fmt.Sprintf("msm B2 %d (%s)", len(pk.G2.B), where), t)
 		return bs, err
+	}
+	cpuG2 := func(dst *curve.G2Jac, bases []curve.G2Affine, scalars []fr.Element) error {
+		return msmG2(dst, bases, scalars, block)
 	}
 
 	// On a Mac the G1 sums run on the GPU, then the G2 one on the CPU: the GPU's sums need the CPU's cores to sort each block
@@ -184,7 +188,7 @@ func proveLean(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness witness.
 	var g1err, g2err error
 	if useGPU {
 		g1err = g1("GPU", gpuMsmG1)
-		gpuMsmRelease()
+		gpuMsmReleaseG1()
 		if g1err != nil {
 			gpuMsmOff(g1err.Error())
 			useGPU = false
@@ -194,7 +198,16 @@ func proveLean(r1cs *cs.R1CS, pk *groth16_bn254.ProvingKey, fullWitness witness.
 		g1err = g1("CPU", cpuG1)
 	}
 	if g1err == nil {
-		bs, g2err = g2()
+		if useGPU && gpuMsmCanaryG2(pk.G2.B) {
+			bs, g2err = g2("GPU", gpuMsmG2)
+			gpuMsmRelease()
+			if g2err != nil {
+				gpuMsmOff(g2err.Error())
+				bs, g2err = g2("CPU", cpuG2)
+			}
+		} else {
+			bs, g2err = g2("CPU", cpuG2)
+		}
 	}
 	if g1err != nil {
 		return nil, g1err
