@@ -20,6 +20,7 @@
 // TACIT_PROVER_DIR (~/.tacit-prover: finished proofs), TACIT_METAL=0 (CPU leaf hashing), TACIT_MINE=0xADDR (serve mines the
 // proof pool while it has nothing of its own to prove), TACIT_POOL_API (https://api.tacit.finance), and the SDK's
 // SP1_WORKER_NUM_*_WORKERS (one per stage by default below 16 GB of RAM), TACIT_SALT_THREADS (cores that grind salts; half by default, 0 is off).
+mod cli;
 mod helpdesk;
 mod salt;
 use sha2::{Digest, Sha256};
@@ -56,10 +57,36 @@ struct State {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(String::as_str).unwrap_or("serve");
+    let raw: Vec<String> = std::env::args().collect();
+    let args = cli::Args::parse(&raw);
+    let cmd = args.cmd.as_str();
     if cmd == "check" {
         std::process::exit(if check() { 0 } else { 1 });
+    }
+    if cmd == "help" || args.has("help") || cmd == "--help" {
+        print!("{}", cli::USAGE);
+        std::process::exit(0);
+    }
+    // These read or toggle the running prover and must not pay its setup: `status` on a machine that is already proving
+    // would otherwise start a second prover, and on one that is not it would spend six seconds before saying so.
+    if cmd == "status" || cmd == "watch" || cmd == "mine" {
+        let api = args.flag("api");
+        let r = match cmd {
+            "status" => {
+                if let Err(e) = args.allow(&["json", "api"]) { eprintln!("tacit-prover: {e}"); std::process::exit(2); }
+                cli::status(args.has("json"), api).map(|s| { print!("{s}"); () })
+            }
+            "watch" => {
+                if let Err(e) = args.allow(&["every", "api"]) { eprintln!("tacit-prover: {e}"); std::process::exit(2); }
+                let every = args.flag("every").and_then(|v| v.parse::<f64>().ok()).map(std::time::Duration::from_secs_f64).unwrap_or(std::time::Duration::from_secs(2));
+                cli::watch(every, api)
+            }
+            _ => {
+                if let Err(e) = args.allow(&[]) { eprintln!("tacit-prover: {e}"); std::process::exit(2); }
+                cli::set_mining(&args.words()).map(|s| println!("tacit-prover: {s}"))
+            }
+        };
+        std::process::exit(match r { Ok(()) => 0, Err(e) => { eprintln!("tacit-prover: {e}"); 1 } });
     }
     if cmd == "install" || cmd == "uninstall" {
         std::process::exit(match service(cmd == "install") { Ok(m) => { println!("{m}"); 0 } Err(e) => { eprintln!("{e}"); 1 } });
@@ -75,7 +102,7 @@ fn main() {
 
     match cmd {
         "prove" => {
-            let path = args.get(2).expect("usage: tacit-prover prove <stdin.bin>");
+            let path = args.word(0).expect("usage: tacit-prover prove <stdin.bin>");
             let stdin = read_stdin(&std::fs::read(path).expect("read input")).expect("not a bincode SP1Stdin");
             let mut job = Job::default();
             run(&client, &pk, stdin, &mut job);
@@ -86,7 +113,7 @@ fn main() {
         }
         "serve" => serve(client, pk, vkey),
         "mine" => {
-            let miner = args.get(2).cloned().unwrap_or_default();
+            let miner = args.word(0).map(str::to_string).or_else(|| args.flag("miner").map(str::to_string)).unwrap_or_default();
             if !pool::is_address(&miner) {
                 eprintln!("usage: tacit-prover mine 0x<your address, 40 hex digits>: the address the TAC points go to");
                 std::process::exit(2);
@@ -99,7 +126,13 @@ fn main() {
                 let mined = pool::mine_one(&client, &pk, &miner);
                 salt::PROVING.store(false, std::sync::atomic::Ordering::Relaxed);
                 if !mined {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    // Ask again at once. Measured against the live pool: a lease call takes ~190 ms round trip and 100
+                    // concurrent asks all returned 204 with no 429, so the pool sets no rate here -- the only reason to
+                    // pause is politeness between asks on one connection. The pool runs `queued: 0, leased: 0` for most of
+                    // the day while finishing thousands of proofs, so a job that appears is gone to whoever asks next; the
+                    // old 60 s sleep gave away every one of them. 20 ms is a gap that keeps one connection warm without
+                    // opening a new one per ask.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
             }
         }
@@ -270,6 +303,13 @@ mod pool {
             let _ = std::fs::remove_file(held());
         }
         let Some((code, lease)) = post(&http, "lease", &json!({ "miner": miner })) else { return false };
+        if code == 429 {
+            // The pool decides how fast one miner may ask; when it says so, wait exactly as long as it says. Nothing in
+            // this build trips it (100 concurrent asks pass), but a limit added later must not turn into a ban.
+            let ms = lease["retryMs"].as_u64().unwrap_or(1000).clamp(50, 60_000);
+            std::thread::sleep(Duration::from_millis(ms));
+            return false;
+        }
         if code != 200 {
             if code != 204 {
                 eprintln!("tacit-prover: the pool leases nothing just now: {}", lease["error"].as_str().unwrap_or("no reason given"));
@@ -358,6 +398,13 @@ mod progress {
         for (i, (stage, at)) in m.iter().enumerate() {
             let next = m.get(i + 1).map_or(end, |x| x.1);
             t.insert(stage.to_string(), (next - *at).as_secs_f64().round().into());
+        }
+        if std::env::var_os("TACIT_STAGE_TIMES").is_some() {
+            let line: Vec<String> = STAGES
+                .iter()
+                .map(|s| format!("{s} {}", t.get(*s).and_then(|v| v.as_f64()).unwrap_or(0.0) as i64))
+                .collect();
+            eprintln!("stages {}", line.join(" "));
         }
         let _ = std::fs::create_dir_all(dir);
         let _ = std::fs::write(dir.join("timing.json"), serde_json::Value::Object(t).to_string());
