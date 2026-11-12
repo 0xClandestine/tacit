@@ -30,6 +30,12 @@ fn gpu_dft<F: TwoAdicField + 'static>(
     reverse_slice_index_bits(&mut tw);
     let tw_rev = limbs(&tw);
     let mut values = limbs(&mat.values);
+    // The four-step variant does the same transform in three passes over the matrix instead of log_h, which is most of
+    // the reason a DFT this size is memory-bound. It declines shapes its tile cannot hold, and the plain path below
+    // covers those. It emits the materialised row order, so it skips the bit_reverse_rows view the plain path needs.
+    // The four-step variant (tacit_ntt::dft_fourstep_in_place) is not wired in: it matches this kernel for some
+    // shapes but not the ones the prover uses (log_h 18, width 5 is the first that differs), so the plain network stays
+    // the only path. crates/ntt's fs_vs_plain test is the gate it has to pass first.
     tacit_ntt::dft_in_place(&mut values, mat.width(), &tw_fwd, &tw_rev)?;
     // `dft_in_place` leaves the rows in the physical order the CPU matrix has before its trailing `bit_reverse_rows`
     // view, so the view is built here exactly as the CPU path does.

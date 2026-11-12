@@ -342,12 +342,13 @@ pub fn debug_layer(
 // Each sub-DFT is the network of `kb_fs_tile`, which is p3's Radix2DitParallel: input bit-reversal, dit_layer for
 // layers 0..mid, the row reversal, then dit_layer_rev for layers mid..n_log with reversed twiddles.
 
-/// Whether the four-step path can run this shape.
+/// Whether the four-step kernel can do this shape. Even `log_h` only: the two sub-DFTs are then the same length, and
+/// an odd one needs the stage tables of a different length each time, which is not right yet (log_h 15, width 21).
 pub fn fourstep_supported(log_h: usize, width: usize) -> bool {
-    available() && (2..=24).contains(&log_h) && width > 0 && log_h.div_ceil(2) <= 12
+    available() && (2..=24).contains(&log_h) && width > 0 && log_h % 2 == 0 && log_h / 2 <= 12
 }
 
-/// A four-step DFT of an `h x width` matrix, in place, in the same order `dft_batch` materialises.
+/// A four-step DFT of an `h x width` matrix, in place, in the same physical row order [`dft_in_place`] leaves.
 pub fn dft_fourstep_in_place(values: &mut [u32], width: usize, tw_fwd: &[u32]) -> Option<()> {
     let h = if width == 0 { 0 } else { values.len() / width };
     if width == 0 || h == 0 || !h.is_power_of_two() {
@@ -400,16 +401,9 @@ pub fn dft_fourstep_in_place(values: &mut [u32], width: usize, tw_fwd: &[u32]) -
         if std::env::var("TACIT_NTT_DEBUG").is_ok() { eprintln!("fourstep: stage 3 rc={r}"); }
         return None;
     }
-    let mut out = vec![0u32; values.len()];
-    for k2 in 0..n2 {
-        for k1 in 0..n1 {
-            // stage 3 leaves frequency k1 at physical row br(k1) within sub k2
-            let src = (rev_bits(k1, n1_log) + n1 * k2) * width;
-            let dst = (k2 + n2 * k1) * width;
-            out[dst..dst + width].copy_from_slice(&values[src..src + width]);
-        }
-    }
-    values.copy_from_slice(&out);
+    // Stage 3 already leaves the rows in the physical order `dft_in_place` does: measured against it directly at
+    // log_h 4 with width 16, every row matched with no readout at all. Nothing to permute here; the values and their
+    // placement were both right once the twiddles were, and a spurious reversal of my own is what hid that.
     Some(())
 }
 
