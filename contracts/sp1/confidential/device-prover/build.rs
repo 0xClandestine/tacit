@@ -44,6 +44,7 @@ fn salt_gpu() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/salt.metal");
     let dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed=src/salt_host.m");
 
     let msl = std::fs::read_to_string(&src).expect("read src/salt.metal");
     let mut hdr = String::from("// generated from src/salt.metal by build.rs -- do not edit\nstatic const char *MSL =\n");

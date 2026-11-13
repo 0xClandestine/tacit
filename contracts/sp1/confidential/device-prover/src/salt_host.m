@@ -57,7 +57,7 @@ static SaltGPU *gpu(void) {
         g->bBase = [g->dev newBufferWithLength:8  options:MTLResourceStorageModeShared];
         g->bTgt  = [g->dev newBufferWithLength:4  options:MTLResourceStorageModeShared];
         g->bFound= [g->dev newBufferWithLength:4  options:MTLResourceStorageModeShared];
-        g->bNonce= [g->dev newBufferWithLength:256*8 options:MTLResourceStorageModeShared];
+        g->bNonce= [g->dev newBufferWithLength:1024*8 options:MTLResourceStorageModeShared];
         if (!g->bG || !g->bC || !g->bP || !g->bBase || !g->bTgt || !g->bFound || !g->bNonce) {
             free_gpu(g); return NULL;
         }
@@ -147,7 +147,7 @@ int tacit_salt_gpu_grind(const unsigned char *shape, uint64_t base, uint32_t tar
         if (cb.error) return -1;
 
         uint32_t f = *(uint32_t *)[g->bFound contents];
-        if (f > 256) f = 256;
+        if (f > 1024) f = 1024;
         if (f > max) f = max;
         if (f) memcpy(out, [g->bNonce contents], f * sizeof(unsigned long long));
         n = (int)f;

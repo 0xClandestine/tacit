@@ -1,6 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 constant uint64_t RC[24]={0x1,0x8082,0x800000000000808aULL,0x8000000080008000ULL,0x808b,0x80000001,0x8000000080008081ULL,0x8000000000008009ULL,0x8a,0x88,0x80008009,0x8000000a,0x8000808b,0x800000000000008bULL,0x8000000000008089ULL,0x8000000000008003ULL,0x8000000000008002ULL,0x8000000000000080ULL,0x800a,0x800000008000000aULL,0x8000000080008081ULL,0x8000000000008080ULL,0x80000001,0x8000000080008008ULL};
+// The most hits one dispatch can record. At the pool's 26 bits a 32M batch finds about one, but the
+// pool may ask as few as 16, where a 32M batch finds ~512: the buffer is sized for that.
+constant uint MAXFOUND = 1024;
 constant int RHO[24]={1,3,6,10,15,21,28,36,45,55,2,14,27,41,56,8,25,43,62,18,39,61,20,44};
 constant int PI[24]={10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1};
 static inline uint64_t rotl(uint64_t x,int n){return (x<<n)|(x>>(64-n));}
@@ -34,7 +37,7 @@ kernel void grind(device const uchar *G [[buffer(0)]],
                   constant uint64_t &base [[buffer(3)]],
                   constant uint &target [[buffer(4)]],
                   device atomic_uint *found [[buffer(5)]],
-                  device uint *foundNonce [[buffer(6)]],
+                  device ulong *foundNonce [[buffer(6)]],
                   uint gid [[thread_position_in_grid]]) {
   uint64_t n = base + gid;
 
@@ -69,7 +72,7 @@ kernel void grind(device const uchar *G [[buffer(0)]],
 
   if (count_bits(a) >= target) {
     uint slot = atomic_fetch_add_explicit(found, 1u, memory_order_relaxed);
-    if (slot < 256) foundNonce[slot] = (uint)n;
+    if (slot < MAXFOUND) foundNonce[slot] = n;
   }
 }
 

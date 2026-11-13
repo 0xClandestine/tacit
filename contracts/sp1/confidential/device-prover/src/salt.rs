@@ -84,7 +84,7 @@ fn grind_gpu() {
     g[55] = 0x01;
 
     let mut n: u64 = rand::random::<u64>();
-    let mut found = Vec::with_capacity(256);
+    let mut found = Vec::with_capacity(1024);
     let mut day_cached = u64::MAX;
     let mut shape = shape_for(g, day(), proxy_hash);
 
@@ -97,7 +97,7 @@ fn grind_gpu() {
         }
         let t = Instant::now();
         found.clear();
-        if !crate::salt_gpu::grind(&shape, n, MIN_BITS.load(Ordering::Relaxed) as u32, &mut found, 256) {
+        if !crate::salt_gpu::grind(&shape, n, MIN_BITS.load(Ordering::Relaxed) as u32, &mut found, 1024) {
             eprintln!("tacit-prover: the salt GPU stopped; restart the prover to grind on the cores again");
             return;
         }
