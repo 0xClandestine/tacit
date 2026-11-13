@@ -23,6 +23,7 @@
 mod cli;
 mod helpdesk;
 mod salt;
+mod salt_gpu;
 use sha2::{Digest, Sha256};
 use sp1_sdk::{blocking::{ProveRequest, Prover, ProverClient}, Elf, HashableKey, ProvingKey, SP1Stdin};
 use std::collections::{HashMap, VecDeque};
@@ -93,6 +94,20 @@ fn main() {
     }
     lean_workers();
     logger();
+    // `--salt N` used to be documented and then dropped: nothing read it, so grinding always ran on the default half of
+    // the cores. Applied here, before setup, so it covers both `serve` and `mine`. `--no-salt` is the bare switch for the same
+    // thing (0 cores), for callers who only want the proof and none of the salt work.
+    if args.has("no-salt") {
+        std::env::set_var("TACIT_SALT_THREADS", "0");
+    } else if let Some(n) = args.flag("salt") {
+        match n.parse::<usize>() {
+            Ok(v) => std::env::set_var("TACIT_SALT_THREADS", v.to_string()),
+            Err(_) => {
+                eprintln!("tacit-prover: --salt wants a core count (0 is off), not {n:?}");
+                std::process::exit(2);
+            }
+        }
+    }
     let t = Instant::now();
     let client = ProverClient::builder().cpu().build();
     let pk = client.setup(Elf::Static(ELF)).expect("setup failed");

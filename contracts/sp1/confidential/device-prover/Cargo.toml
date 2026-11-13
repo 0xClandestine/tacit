@@ -51,3 +51,6 @@ p3-koala-bear = { path = "patches/p3-koala-bear" }
 p3-field = { path = "patches/p3-field" }
 p3-merkle-tree = { path = "patches/p3-merkle-tree" }
 p3-symmetric = { path = "patches/p3-symmetric" }
+
+[build-dependencies]
+cc = "1"

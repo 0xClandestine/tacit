@@ -285,6 +285,7 @@ tacit-prover — prove the pool's jobs, or your own
 options
   --miner 0x<address>          the address the TAC points go to
   --salt N                     cores for salt grinding while waiting (0 is off)
+  --no-salt                    same as --salt 0: prove only, grind no salts
   --port N                     the local API port (default 47815)
   --api URL                    the pool API (default https://api.tacit.finance)
   --dir PATH                   where proofs, logs and timing live (default ~/.tacit-prover)

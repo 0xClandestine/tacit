@@ -4593,6 +4593,7 @@ name = "tacit-prover"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "cc",
  "hex",
  "rand 0.8.7",
  "reqwest",

@@ -45,6 +45,16 @@ fn keccak(parts: &[&[u8]]) -> [u8; 32] {
 }
 fn day() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() / 86400).unwrap_or(0) }
 
+// The grind's constants and hash, for the GPU's equivalence test (src/salt_gpu.rs). Not used at run time.
+#[cfg(test)]
+pub(crate) const DEPLOYER_TEST: [u8; 20] = DEPLOYER;
+#[cfg(test)]
+pub(crate) const CREATEX_TEST: [u8; 20] = CREATEX;
+#[cfg(test)]
+pub(crate) const PROXY_INIT_TEST: [u8; 16] = PROXY_INIT;
+#[cfg(test)]
+pub(crate) fn keccak_test(parts: &[&[u8]]) -> [u8; 32] { keccak(parts) }
+
 // The CREATE3 address of a salt from the deployer, and its leading zero bits.
 pub fn address(salt: &[u8; 32], proxy_hash: &[u8; 32]) -> ([u8; 20], u32) {
     let guarded = keccak(&[&[0u8; 12], &DEPLOYER, salt]);
@@ -62,6 +72,62 @@ pub fn address(salt: &[u8; 32], proxy_hash: &[u8; 32]) -> ([u8; 20], u32) {
 }
 
 fn active() -> bool { crate::pool::miner().is_some() && !PROVING.load(Ordering::Relaxed) }
+
+// The GPU grind: one thread, one dispatch at a time, 4.2M counters each. The device does about 150 M attempts/s,
+// five times the sixteen cores, so this thread alone outruns the whole CPU path while leaving every core for proving.
+fn grind_gpu() {
+    let proxy_hash = keccak(&[&PROXY_INIT]);
+    // guarded = 00*12 || DEPLOYER || salt, with the counter (salt[24..32), i.e. g[56..64)) left for the kernel.
+    let mut g = [0u8; 64];
+    g[12..32].copy_from_slice(&DEPLOYER);
+    g[32..52].copy_from_slice(&DEPLOYER);
+    g[55] = 0x01;
+
+    let mut n: u64 = rand::random::<u64>();
+    let mut found = Vec::with_capacity(256);
+    let mut day_cached = u64::MAX;
+    let mut shape = shape_for(g, day(), proxy_hash);
+
+    loop {
+        if !active() { std::thread::sleep(Duration::from_secs(5)); continue; }
+        let d = day();
+        if d != day_cached {
+            shape = shape_for(g, d, proxy_hash);
+            day_cached = d;
+        }
+        let t = Instant::now();
+        found.clear();
+        if !crate::salt_gpu::grind(&shape, n, MIN_BITS.load(Ordering::Relaxed) as u32, &mut found, 256) {
+            eprintln!("tacit-prover: the salt GPU stopped; restart the prover to grind on the cores again");
+            return;
+        }
+        n = n.wrapping_add(crate::salt_gpu::BATCH);
+        let secs = t.elapsed().as_secs_f64().max(1e-6);
+        HASHES.fetch_add(crate::salt_gpu::BATCH, Ordering::Relaxed);
+        record_rate(crate::salt_gpu::BATCH as f64 / secs);
+        for &hit in &found {
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&shape.g[32..64]);
+            s[24..32].copy_from_slice(&hit.to_be_bytes());
+            let (_, b) = address(&s, &proxy_hash);
+            FOUND.lock().unwrap().push((s, b));
+        }
+    }
+}
+
+// `guarded`'s fixed half with today's day at salt[21..23), which is g[53..55).
+fn shape_for(mut g: [u8; 64], d: u64, proxy_hash: [u8; 32]) -> crate::salt_gpu::Shape {
+    g[53..55].copy_from_slice(&((d % 65536) as u16).to_be_bytes());
+    crate::salt_gpu::Shape { g, createx: CREATEX, proxy_hash }
+}
+
+// The grinders' rate, for GET /mine: an exponential average, never a single noisy batch.
+fn record_rate(per_sec: f64) {
+    let mut r = RATE.lock().unwrap();
+    let (avg, _) = *r;
+    let next = if avg <= 0.0 { per_sec } else { avg * 0.8 + per_sec * 0.2 };
+    *r = (next, Some((Instant::now(), HASHES.load(Ordering::Relaxed))));
+}
 
 fn grind(seed: u64) {
     let proxy_hash = keccak(&[&PROXY_INIT]);
@@ -163,6 +229,13 @@ pub fn start() {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let threads = std::env::var("TACIT_SALT_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or((cores / 2).max(1));
     if threads == 0 { return; }
+    // The GPU is about five times the sixteen cores, so when it is there it does the grinding alone: the CPU
+    // threads are left for proving, and no core is spent on Keccak. TACIT_SALT_GPU=0 forces the cores back on.
+    if crate::salt_gpu::available() {
+        std::thread::Builder::new().name("salt-gpu".into()).spawn(grind_gpu).ok();
+        std::thread::spawn(send);
+        return;
+    }
     let base: u64 = rand::random();
     for t in 0..threads {
         let seed = (base & 0x00ff_ffff_ffff_ffff) | ((t as u64 & 0xff) << 56);

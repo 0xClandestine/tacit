@@ -19,6 +19,8 @@ fn main() {
     println!("cargo:rerun-if-changed={}", elf.display());
     println!("cargo:rerun-if-changed=build.rs");
 
+    salt_gpu();
+
     let bytes = match std::fs::read(&elf) {
         Ok(b) => b,
         Err(e) => panic!("cannot read guest ELF at {}: {e}", elf.display()),
@@ -33,6 +35,43 @@ fn main() {
         );
     }
 }
+
+// The salt grind's Metal host (src/salt_host.m) compiles src/salt.metal at run time, so the MSL is
+// embedded as a C string. Generating the header here rather than committing it keeps the two from
+// drifting: edit the .metal, and the next build carries it.
+#[cfg(target_os = "macos")]
+fn salt_gpu() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/salt.metal");
+    let dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let msl = std::fs::read_to_string(&src).expect("read src/salt.metal");
+    let mut hdr = String::from("// generated from src/salt.metal by build.rs -- do not edit\nstatic const char *MSL =\n");
+    hdr.push('"');
+    for ch in msl.chars() {
+        match ch {
+            '"' => hdr.push_str("\\\""),
+            '\\' => hdr.push_str("\\\\"),
+            '\n' => hdr.push_str("\\n\"\n\""),
+            c => hdr.push(c),
+        }
+    }
+    hdr.push_str("\";\n");
+    std::fs::write(dir.join("salt_msl.h"), hdr).expect("write salt_msl.h");
+
+    cc::Build::new()
+        .file("src/salt_host.m")
+        .include(&dir)
+        .flag("-fobjc-arc")
+        .flag("-O2")
+        .flag("-Wno-deprecated-declarations")
+        .compile("tacit_salt_gpu");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn salt_gpu() {}
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
